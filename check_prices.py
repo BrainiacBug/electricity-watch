@@ -520,6 +520,12 @@ def write_html(text_report, data):
         f.write(html)
     print(f"Wrote {OUTPUT_HTML}")
 
+    # Tell GitHub Pages to skip the Jekyll build and serve this folder as plain
+    # static files — without this, Pages tries to run Jekyll over docs/ and can
+    # fail with "No such file or directory" style errors.
+    nojekyll_path = os.path.join(os.path.dirname(OUTPUT_HTML) or ".", ".nojekyll")
+    open(nojekyll_path, "a").close()
+
 
 def main():
     day, slots = None, []
