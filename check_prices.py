@@ -2,10 +2,11 @@
 """
 Daily Estonian electricity price checker.
 
-Fetches tomorrow's Nord Pool day-ahead prices for Estonia (EE) from the
-public Elering API, finds the cheapest non-overlapping time windows for
-your appliance runs, sends the result via ntfy.sh push notification, and
-writes an HTML report (for GitHub Pages).
+Fetches today's + tomorrow's Nord Pool day-ahead prices for Estonia (EE) from
+the public Elering API, finds the cheapest non-overlapping time windows
+(looking forward from right now, so they can span across midnight) for your
+appliance runs, sends the result via ntfy.sh push notification, and writes
+an HTML report with a two-day view (for GitHub Pages).
 
 Edit the JOBS list and PRICE_THRESHOLD below to match your own appliances.
 Run locally to test:  NTFY_TOPIC=your-topic python3 check_prices.py
@@ -53,19 +54,21 @@ RETRY_SLEEP_SECONDS = 300  # 5 min between retries if tomorrow's data isn't publ
 # ---------------------------------------------------------------------------
 
 
-def fetch_tomorrow_prices():
+def fetch_two_day_prices():
+    """Fetch a single continuous window covering all of today + all of tomorrow
+    (local time), so scheduling can look forward across the midnight boundary."""
     tz = ZoneInfo(TIMEZONE)
     now_local = datetime.now(tz)
-    tomorrow_local = (now_local + timedelta(days=1)).date()
+    today_local = now_local.date()
+    tomorrow_local = today_local + timedelta(days=1)
 
-    start_local = datetime(tomorrow_local.year, tomorrow_local.month, tomorrow_local.day, 0, 0, 0, tzinfo=tz)
-    end_local = start_local + timedelta(days=1) - timedelta(seconds=1)
+    start_local = datetime(today_local.year, today_local.month, today_local.day, 0, 0, 0, tzinfo=tz)
+    end_local = start_local + timedelta(days=2) - timedelta(seconds=1)
 
     start_utc = start_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     end_utc = end_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.999Z")
 
     url = f"{ELERING_URL}?start={start_utc}&end={end_utc}&fields=ee"
-
     req = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": "electricity-watch-script/1.0"},
@@ -81,10 +84,9 @@ def fetch_tomorrow_prices():
         }
         for s in raw_slots
     ]
-    # keep only slots that actually fall on tomorrow (API sometimes pads a boundary slot)
-    slots = [s for s in slots if s["dt"].date() == tomorrow_local]
+    slots = [s for s in slots if s["dt"].date() in (today_local, tomorrow_local)]
     slots.sort(key=lambda s: s["dt"])
-    return tomorrow_local, slots
+    return today_local, tomorrow_local, slots
 
 
 def slot_minutes(slots):
@@ -109,6 +111,8 @@ def best_window(slots, used, need_slots):
 
 
 def schedule_jobs(slots, jobs):
+    if not slots:
+        return [{**job, "error": "no price data available"} for job in jobs]
     step = slot_minutes(slots)
     used = set()
     results = []
@@ -144,30 +148,75 @@ def cheap_ranges(slots, threshold):
     ]
 
 
-def build_report(day, slots):
-    if not slots:
-        text = (
-            f"Tomorrow's ({day}) prices aren't published on Elering yet.\n"
-            "This usually means the check ran before the ~13:00-15:00 CET/EET publish window."
-        )
-        return text, None
+def day_summary(day_slots, threshold):
+    if not day_slots:
+        return None
+    prices = [s["price"] for s in day_slots]
+    return {
+        "avg": sum(prices) / len(prices),
+        "min": min(prices),
+        "max": max(prices),
+        "cheap": cheap_ranges(day_slots, threshold),
+        "slots": day_slots,
+    }
 
-    prices = [s["price"] for s in slots]
-    avg_price, min_price, max_price = sum(prices) / len(prices), min(prices), max(prices)
-    cheap = cheap_ranges(slots, PRICE_THRESHOLD)
-    jobs_result = schedule_jobs(slots, JOBS)
 
-    lines = [f"Estonia electricity - {day}", "", f"Avg {avg_price:.1f} / min {min_price:.1f} / max {max_price:.1f} EUR/MWh", ""]
+def day_label(d, today, tomorrow):
+    if d == today:
+        return "Today"
+    if d == tomorrow:
+        return "Tomorrow"
+    return d.strftime("%b %d")
 
-    if cheap:
-        lines.append(f"Cheap periods (< {PRICE_THRESHOLD:.0f} EUR/MWh):")
-        for c in cheap:
-            lines.append(f"  {c['start'].strftime('%H:%M')}-{fmt_hm(c['end'], day)} (avg {c['avg_price']:.1f})")
-    else:
-        lines.append(f"No hours below {PRICE_THRESHOLD:.0f} EUR/MWh tomorrow.")
-    lines.append("")
 
-    lines.append("Suggested non-overlapping slots:")
+def fmt_hm(dt, ref_day):
+    """Format a time as HH:MM, showing 24:00 instead of 00:00 when it's really
+    midnight at the end of ref_day (rather than the start of the next one)."""
+    return "24:00" if dt.date() != ref_day else dt.strftime("%H:%M")
+
+
+def fmt_range(start, end, today, tomorrow):
+    """Human label for a start/end pair that may cross midnight, e.g.
+    'Today 23:00 - Tomorrow 01:00' or 'Tomorrow 01:00-05:00'."""
+    s_label = day_label(start.date(), today, tomorrow)
+    if end.date() == start.date():
+        return f"{s_label} {start.strftime('%H:%M')}\u2013{fmt_hm(end, start.date())}"
+    e_label = day_label(end.date(), today, tomorrow)
+    return f"{s_label} {start.strftime('%H:%M')} \u2013 {e_label} {end.strftime('%H:%M')}"
+
+
+def build_report(today, tomorrow, slots):
+    today_slots = [s for s in slots if s["dt"].date() == today]
+    tomorrow_slots = [s for s in slots if s["dt"].date() == tomorrow]
+
+    if not today_slots:
+        return "No price data available from Elering right now.", None
+
+    now = datetime.now(ZoneInfo(TIMEZONE))
+    step = slot_minutes(slots)
+    future_slots = [s for s in slots if s["dt"] + timedelta(minutes=step) > now]
+
+    jobs_result = schedule_jobs(future_slots, JOBS)
+
+    today_sum = day_summary(today_slots, PRICE_THRESHOLD)
+    tomorrow_sum = day_summary(tomorrow_slots, PRICE_THRESHOLD)
+
+    lines = ["Estonia electricity", ""]
+
+    for label, summ, day in (("TODAY", today_sum, today), ("TOMORROW", tomorrow_sum, tomorrow)):
+        lines.append(f"{label} ({day}):")
+        if summ is None:
+            lines.append("  not published yet")
+        else:
+            lines.append(f"  avg {summ['avg']:.1f} / min {summ['min']:.1f} / max {summ['max']:.1f} EUR/MWh")
+            if summ["cheap"]:
+                for c in summ["cheap"]:
+                    lines.append(f"    cheap {c['start'].strftime('%H:%M')}-{fmt_hm(c['end'], day)} (avg {c['avg_price']:.1f})")
+            else:
+                lines.append(f"    no hours below {PRICE_THRESHOLD:.0f} EUR/MWh")
+        lines.append("")
+
+    lines.append("Suggested next slots (from now onward):")
     for r in jobs_result:
         if "error" in r:
             lines.append(f"  {r['name']}: {r['error']}")
@@ -175,12 +224,13 @@ def build_report(day, slots):
             flag = "OK" if r["avg_price"] < PRICE_THRESHOLD else "!!"
             lines.append(
                 f"  [{flag}] {r['name']} ({r['minutes']}min): "
-                f"{r['start'].strftime('%H:%M')}-{fmt_hm(r['end'], day)} (avg {r['avg_price']:.1f} EUR/MWh)"
+                f"{fmt_range(r['start'], r['end'], today, tomorrow)} (avg {r['avg_price']:.1f} EUR/MWh)"
             )
 
     return "\n".join(lines), {
-        "day": day, "avg": avg_price, "min": min_price, "max": max_price,
-        "cheap": cheap, "jobs": jobs_result, "slots": slots,
+        "today": today, "tomorrow": tomorrow,
+        "today_sum": today_sum, "tomorrow_sum": tomorrow_sum,
+        "jobs": jobs_result, "now": now,
     }
 
 
@@ -192,7 +242,7 @@ def send_ntfy(text):
         NTFY_URL,
         data=text.encode("utf-8"),
         method="POST",
-        headers={"Title": "Electricity prices tomorrow", "Priority": "default", "Tags": "zap"},
+        headers={"Title": "Electricity prices", "Priority": "default", "Tags": "zap"},
     )
     try:
         urllib.request.urlopen(req, timeout=15)
@@ -225,7 +275,7 @@ PAGE_HEAD = """<!DOCTYPE html>
     background: var(--graphite-900);
     color: var(--ink);
     font-family: 'Inter', system-ui, sans-serif;
-    max-width: 720px;
+    max-width: 860px;
     margin: 0 auto;
     padding: 1.75rem 1.25rem 3rem;
     line-height: 1.45;
@@ -241,30 +291,13 @@ PAGE_HEAD = """<!DOCTYPE html>
     display: flex;
     align-items: center;
     justify-content: space-between;
-  }
-  .headline {
-    display: flex;
-    align-items: baseline;
-    gap: 0.9rem;
-    margin: 1.1rem 0 0.3rem;
-    flex-wrap: wrap;
-  }
-  .headline .num {
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 700;
-    font-size: 3.1rem;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: -0.02em;
-  }
-  .headline .unit {
-    font-size: 0.95rem;
-    color: var(--ink-muted);
+    margin-bottom: 1.2rem;
   }
   .pill {
     font-family: 'JetBrains Mono', monospace;
-    font-size: 0.75rem;
+    font-size: 0.7rem;
     font-weight: 500;
-    padding: 0.25rem 0.6rem;
+    padding: 0.2rem 0.55rem;
     border-radius: 999px;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -272,52 +305,60 @@ PAGE_HEAD = """<!DOCTYPE html>
   .pill.cheap { background: rgba(95,232,163,0.15); color: var(--cheap); }
   .pill.mid   { background: rgba(240,180,41,0.15); color: var(--mid); }
   .pill.high  { background: rgba(240,102,90,0.18); color: var(--high); }
-  .stats {
-    display: flex;
-    gap: 1.5rem;
-    margin: 0.4rem 0 1.6rem;
-    color: var(--ink-muted);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.85rem;
+  .daygrid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1rem;
+    margin-bottom: 1.8rem;
   }
-  .stats b { color: var(--ink); font-weight: 500; }
-  .panel {
+  .daycol {
     background: var(--graphite-800);
     border: 1px solid var(--hairline);
     border-radius: 14px;
-    padding: 1.1rem 1.1rem 0.9rem;
+    padding: 1.1rem 1.1rem 1rem;
   }
+  .day-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+    font-weight: 500;
+    font-size: 1rem;
+    margin-bottom: 0.5rem;
+  }
+  .day-stats {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    margin-bottom: 0.8rem;
+  }
+  .day-stats b { color: var(--ink); font-weight: 500; }
   .panel svg { width: 100%; height: auto; display: block; }
   .ticks {
     display: flex;
     justify-content: space-between;
-    margin-top: 0.5rem;
+    margin-top: 0.4rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.68rem;
+    color: var(--ink-muted);
+  }
+  .day-cheap {
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.72rem;
     color: var(--ink-muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 0.7rem;
+    margin-top: 0.7rem;
   }
-  .lanes { margin-top: 1.1rem; }
-  .lane { margin-top: 0.65rem; }
-  .lane:first-child { margin-top: 0; }
-  .lane-label {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.75rem;
-    font-weight: 500;
-    margin-bottom: 0.3rem;
+  .day-cheap span { color: var(--cheap); }
+  .pending {
+    text-align: center;
+    color: var(--ink-muted);
+    padding: 2rem 0.5rem 1.2rem;
+    font-size: 0.85rem;
   }
-  .lane-track {
-    position: relative;
-    height: 10px;
-    background: var(--hairline);
-    border-radius: 999px;
-    overflow: hidden;
-  }
-  .lane-fill {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    border-radius: 999px;
-  }
+  .pending .bolt { font-size: 1.4rem; margin-bottom: 0.4rem; }
   .section-label {
     font-family: 'Space Grotesk', system-ui, sans-serif;
     font-weight: 500;
@@ -327,7 +368,7 @@ PAGE_HEAD = """<!DOCTYPE html>
   }
   .cards {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
     gap: 0.7rem;
   }
   .card {
@@ -340,7 +381,7 @@ PAGE_HEAD = """<!DOCTYPE html>
   .card .name { font-size: 0.85rem; color: var(--ink-muted); margin-bottom: 0.3rem; }
   .card .time {
     font-family: 'JetBrains Mono', monospace;
-    font-size: 1.05rem;
+    font-size: 0.95rem;
     font-variant-numeric: tabular-nums;
   }
   .card .price {
@@ -349,15 +390,6 @@ PAGE_HEAD = """<!DOCTYPE html>
     color: var(--ink-muted);
     margin-top: 0.2rem;
   }
-  .cheap-list {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.85rem;
-    color: var(--ink-muted);
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem 0.9rem;
-  }
-  .cheap-list span { color: var(--cheap); }
   .empty {
     background: var(--graphite-800);
     border: 1px dashed var(--hairline);
@@ -374,7 +406,7 @@ PAGE_HEAD = """<!DOCTYPE html>
     font-family: 'JetBrains Mono', monospace;
   }
   @media (prefers-reduced-motion: no-preference) {
-    .panel, .card { transition: border-color 0.2s ease; }
+    .daycol, .card { transition: border-color 0.2s ease; }
   }
 </style></head>
 <body>
@@ -391,18 +423,12 @@ def price_band(price, threshold):
     return "high"
 
 
-def fmt_hm(dt, day):
-    """Format a time as HH:MM, showing 24:00 instead of 00:00 when it's really next-day midnight."""
-    return "24:00" if dt.date() != day else dt.strftime("%H:%M")
-
-
-def build_chart_parts(data, threshold):
-    """Returns (svg, ticks_html, lanes_html). Text lives in normal HTML (rem-sized,
-    stays legible on phones) while the SVG only draws bars/lines (scales cleanly)."""
-    slots = data["slots"]
-    n = len(slots)
-    max_price = max(s["price"] for s in slots) or 1.0
-    bars_h = 190
+def build_day_chart(day_slots, threshold):
+    """Returns (svg, ticks_html) for one day's bars. Text lives in normal HTML
+    (rem-sized, stays legible on phones) while the SVG only draws bars/lines."""
+    n = len(day_slots)
+    max_price = max(s["price"] for s in day_slots) or 1.0
+    bars_h = 280
 
     bar_w = 1000 / n
     gap = min(2.0, bar_w * 0.18)
@@ -416,7 +442,7 @@ def build_chart_parts(data, threshold):
             f'stroke="var(--ink-muted)" stroke-width="1" stroke-dasharray="5 5" opacity="0.5"/>'
         )
 
-    for i, s in enumerate(slots):
+    for i, s in enumerate(day_slots):
         h = max(3.0, (s["price"] / max_price) * bars_h)
         x = i * bar_w + gap / 2
         y = bars_h - h
@@ -426,39 +452,35 @@ def build_chart_parts(data, threshold):
     svg.append(f'<line x1="0" y1="{bars_h}" x2="1000" y2="{bars_h}" stroke="var(--hairline)" stroke-width="1.5"/>')
     svg.append("</svg>")
 
-    # hour ticks — plain HTML flex row so font-size is a real rem value on every screen
     step = max(1, round(n / 6))
-    tick_spans = "".join(f'<span>{slots[i]["dt"].strftime("%H:%M")}</span>' for i in range(0, n, step))
+    tick_spans = "".join(f'<span>{day_slots[i]["dt"].strftime("%H:%M")}</span>' for i in range(0, n, step))
     ticks_html = f'<div class="ticks">{tick_spans}</div>'
 
-    # appliance lanes — HTML rows with a percentage-positioned fill bar under the label
-    day_start = slots[0]["dt"].replace(hour=0, minute=0, second=0, microsecond=0)
-    rows = []
-    for idx, job in enumerate(data["jobs"]):
-        color = JOB_COLORS[idx % len(JOB_COLORS)]
-        if "error" in job:
-            rows.append(
-                f'<div class="lane"><div class="lane-label" style="color:var(--ink-muted)">'
-                f'{job["name"]}: no free slot long enough</div></div>'
-            )
-            continue
-        frac_start = (job["start"] - day_start).total_seconds() / 86400
-        frac_end = (job["end"] - day_start).total_seconds() / 86400
-        left_pct = max(0.0, frac_start * 100)
-        width_pct = max(0.6, min(100.0, frac_end * 100) - left_pct)
-        label = (
-            f'{job["name"]} \u00b7 {job["start"].strftime("%H:%M")}\u2013{fmt_hm(job["end"], data["day"])} '
-            f'\u00b7 {job["avg_price"]:.0f} EUR/MWh'
-        )
-        rows.append(
-            f'<div class="lane">'
-            f'<div class="lane-label" style="color:{color}">{label}</div>'
-            f'<div class="lane-track"><div class="lane-fill" style="left:{left_pct:.2f}%;width:{width_pct:.2f}%;background:{color}"></div></div>'
-            f'</div>'
-        )
-    lanes_html = f'<div class="lanes">{"".join(rows)}</div>'
+    return "\n".join(svg), ticks_html
 
-    return "\n".join(svg), ticks_html, lanes_html
+
+def render_day_column(label, day, summ, threshold):
+    if summ is None:
+        return f"""<div class="daycol">
+  <div class="day-head"><span>{label} &middot; {day}</span></div>
+  <div class="pending"><div class="bolt">&#9889;</div>
+    Not published yet.<br>Usually appears 13:00&ndash;15:00 CET/EET.
+  </div>
+</div>"""
+
+    band = price_band(summ["avg"], threshold)
+    chart_svg, ticks_html = build_day_chart(summ["slots"], threshold)
+    cheap_html = "".join(
+        f'<span>{c["start"].strftime("%H:%M")}&ndash;{fmt_hm(c["end"], day)}</span>'
+        for c in summ["cheap"]
+    ) or '<span style="color:var(--ink-muted)">none</span>'
+
+    return f"""<div class="daycol">
+  <div class="day-head"><span>{label} &middot; {day}</span><span class="pill {band}">{band}</span></div>
+  <div class="day-stats">avg <b>{summ['avg']:.0f}</b> &middot; min <b>{summ['min']:.0f}</b> &middot; max <b>{summ['max']:.0f}</b> EUR/MWh</div>
+  <div class="panel">{chart_svg}{ticks_html}</div>
+  <div class="day-cheap">{cheap_html}</div>
+</div>"""
 
 
 def write_html(text_report, data):
@@ -470,46 +492,36 @@ def write_html(text_report, data):
 <div class="eyebrow"><span>&#9889; Electricity watch</span><span>Estonia</span></div>
 <div class="empty">
   <div class="bolt">&#9889;</div>
-  <div>Tomorrow's prices aren't published yet.</div>
-  <div>Elering usually publishes them between 13:00 and 15:00 CET/EET.<br>The next scheduled check will pick them up automatically.</div>
+  <div>{text_report}</div>
 </div>
 <footer>Checked {updated}</footer>
 """
     else:
-        band = price_band(data["avg"], PRICE_THRESHOLD)
-        chart_svg, ticks_html, lanes_html = build_chart_parts(data, PRICE_THRESHOLD)
+        today, tomorrow = data["today"], data["tomorrow"]
+
+        today_col = render_day_column("Today", today, data["today_sum"], PRICE_THRESHOLD)
+        tomorrow_col = render_day_column("Tomorrow", tomorrow, data["tomorrow_sum"], PRICE_THRESHOLD)
 
         cards = "".join(
             f"""<div class="card" style="--job-color:{JOB_COLORS[i % len(JOB_COLORS)]}">
                   <div class="name">{r['name']}</div>
                   {'<div class="time" style="color:var(--ink-muted);font-size:0.85rem">no free slot long enough</div>' if 'error' in r else
-                   f'<div class="time">{r["start"].strftime("%H:%M")}&ndash;{fmt_hm(r["end"], data["day"])}</div>'
+                   f'<div class="time">{fmt_range(r["start"], r["end"], today, tomorrow)}</div>'
                    f'<div class="price">avg {r["avg_price"]:.1f} EUR/MWh</div>'}
                 </div>"""
             for i, r in enumerate(data["jobs"])
         )
 
-        cheap_html = "".join(
-            f'<span>{c["start"].strftime("%H:%M")}&ndash;{fmt_hm(c["end"], data["day"])}</span>'
-            for c in data["cheap"]
-        ) or '<span style="color:var(--ink-muted)">none today</span>'
-
         body = f"""
-<div class="eyebrow"><span>&#9889; Electricity watch</span><span>{data['day']}</span></div>
-<div class="headline">
-  <span class="num">{data['avg']:.0f}</span>
-  <span class="unit">EUR/MWh avg</span>
-  <span class="pill {band}">{band}</span>
+<div class="eyebrow"><span>&#9889; Electricity watch</span><span>Estonia</span></div>
+
+<div class="daygrid">
+{today_col}
+{tomorrow_col}
 </div>
-<div class="stats">min <b>{data['min']:.0f}</b> &middot; max <b>{data['max']:.0f}</b> &middot; cutoff <b>{PRICE_THRESHOLD:.0f}</b></div>
 
-<div class="panel">{chart_svg}{ticks_html}{lanes_html}</div>
-
-<div class="section-label">Suggested slots</div>
+<div class="section-label">Suggested next slots (from now)</div>
 <div class="cards">{cards}</div>
-
-<div class="section-label">Cheap windows (&lt; {PRICE_THRESHOLD:.0f} EUR/MWh)</div>
-<div class="cheap-list">{cheap_html}</div>
 
 <footer>Updated {updated} &middot; data via Elering / Nord Pool</footer>
 """
@@ -528,16 +540,17 @@ def write_html(text_report, data):
 
 
 def main():
-    day, slots = None, []
+    today, tomorrow, slots = None, None, []
     for attempt in range(1, MAX_RETRIES + 1):
-        day, slots = fetch_tomorrow_prices()
-        if slots:
+        today, tomorrow, slots = fetch_two_day_prices()
+        tomorrow_slots = [s for s in slots if s["dt"].date() == tomorrow]
+        if tomorrow_slots:
             break
         print(f"Attempt {attempt}/{MAX_RETRIES}: tomorrow's prices not published yet, waiting...")
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_SLEEP_SECONDS)
 
-    text_report, data = build_report(day, slots)
+    text_report, data = build_report(today, tomorrow, slots)
     print(text_report)
     send_ntfy(text_report)
     write_html(text_report, data)
